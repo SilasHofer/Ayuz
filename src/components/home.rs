@@ -165,76 +165,6 @@ fn metric_card(icon_name: &str, title: &str) -> (gtk::Box, gtk::Label) {
     (card, value_label)
 }
 
-/// hwmon driver names of CPU temperature sensors, with the preferred sensor
-/// labels in order (`Tdie` is the real die temperature on AMD, `Tctl` may
-/// include a fan-control offset; `Package id 0` is the whole Intel package).
-const CPU_HWMON_DRIVERS: &[(&str, &[&str])] = &[
-    ("k10temp", &["Tdie", "Tctl"]),
-    ("zenpower", &["Tdie", "Tctl"]),
-    ("coretemp", &["Package id 0"]),
-];
-
-async fn read_trimmed(path: &std::path::Path) -> Option<String> {
-    tokio::fs::read_to_string(path)
-        .await
-        .ok()
-        .map(|s| s.trim().to_string())
-}
-
-/// Reads a sysfs temperature file (millidegrees), if present and numeric.
-async fn read_millideg(path: &std::path::Path) -> Option<i32> {
-    read_trimmed(path).await?.parse().ok()
-}
-
-/// Temperature of one CPU hwmon device: the first preferred label that
-/// exists, otherwise `temp1_input`.
-async fn hwmon_cpu_temp(dir: &std::path::Path, labels: &[&str]) -> Option<i32> {
-    let mut by_label = Vec::new();
-    if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let file = entry.file_name().to_string_lossy().into_owned();
-            if let Some(prefix) = file.strip_suffix("_label") {
-                if let Some(label) = read_trimmed(&entry.path()).await {
-                    by_label.push((label, dir.join(format!("{prefix}_input"))));
-                }
-            }
-        }
-    }
-    for wanted in labels {
-        if let Some((_, input)) = by_label.iter().find(|(l, _)| l == wanted) {
-            if let Some(t) = read_millideg(input).await {
-                return Some(t);
-            }
-        }
-    }
-    read_millideg(&dir.join("temp1_input")).await
-}
-
-/// CPU temperature in millidegrees Celsius.
-///
-/// `thermal_zone0` is often a slow ACPI zone (`acpitz`) rather than the CPU,
-/// so the CPU driver's own hwmon sensor is preferred. If none is found the
-/// previous behaviour (reading `fallback`, i.e. `thermal_zone0`) is kept.
-async fn cpu_temp_millideg(hwmon_dir: &std::path::Path, fallback: &std::path::Path) -> Option<i32> {
-    let mut devices = Vec::new();
-    if let Ok(mut entries) = tokio::fs::read_dir(hwmon_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            devices.push(entry.path());
-        }
-    }
-    devices.sort(); // deterministic: hwmon0, hwmon1, ...
-    for (driver, labels) in CPU_HWMON_DRIVERS {
-        for dev in &devices {
-            if read_trimmed(&dev.join("name")).await.as_deref() == Some(*driver) {
-                if let Some(t) = hwmon_cpu_temp(dev, labels).await {
-                    return Some(t);
-                }
-            }
-        }
-    }
-    read_millideg(fallback).await
-}
-
 async fn fetch_metrics() -> HomeCommandOutput {
     let battery = {
         let b0 = tokio::fs::read_to_string(SYS_BATTERY0_CAPACITY)
@@ -320,6 +250,194 @@ async fn fetch_metrics() -> HomeCommandOutput {
         cpu,
         ram,
         disk,
+    }
+}
+
+/// hwmon driver names of CPU temperature sensors, with the preferred sensor
+/// labels in order (`Tdie` is the real die temperature on AMD, `Tctl` may
+/// include a fan-control offset; `Package id 0` is the whole Intel package).
+const CPU_HWMON_DRIVERS: &[(&str, &[&str])] = &[
+    ("k10temp", &["Tdie", "Tctl"]),
+    ("zenpower", &["Tdie", "Tctl"]),
+    ("coretemp", &["Package id 0"]),
+];
+
+async fn read_trimmed(path: &std::path::Path) -> Option<String> {
+    tokio::fs::read_to_string(path)
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// Reads a sysfs temperature file (millidegrees), if present and numeric.
+async fn read_millideg(path: &std::path::Path) -> Option<i32> {
+    read_trimmed(path).await?.parse().ok()
+}
+
+/// Temperature of one CPU hwmon device: the first preferred label that
+/// exists, otherwise `temp1_input`.
+async fn hwmon_cpu_temp(dir: &std::path::Path, labels: &[&str]) -> Option<i32> {
+    let mut by_label = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let file = entry.file_name().to_string_lossy().into_owned();
+            if let Some(prefix) = file.strip_suffix("_label") {
+                if let Some(label) = read_trimmed(&entry.path()).await {
+                    by_label.push((label, dir.join(format!("{prefix}_input"))));
+                }
+            }
+        }
+    }
+    for wanted in labels {
+        if let Some((_, input)) = by_label.iter().find(|(l, _)| l == wanted) {
+            if let Some(t) = read_millideg(input).await {
+                return Some(t);
+            }
+        }
+    }
+    read_millideg(&dir.join("temp1_input")).await
+}
+
+/// CPU temperature in millidegrees Celsius.
+///
+/// `thermal_zone0` is often a slow ACPI zone (`acpitz`) rather than the CPU,
+/// so the CPU driver's own hwmon sensor is preferred. If none is found the
+/// previous behaviour (reading `fallback`, i.e. `thermal_zone0`) is kept.
+async fn cpu_temp_millideg(hwmon_dir: &std::path::Path, fallback: &std::path::Path) -> Option<i32> {
+    let mut devices = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(hwmon_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            devices.push(entry.path());
+        }
+    }
+    devices.sort(); // deterministic: hwmon0, hwmon1, ...
+    for (driver, labels) in CPU_HWMON_DRIVERS {
+        for dev in &devices {
+            if read_trimmed(&dev.join("name")).await.as_deref() == Some(*driver) {
+                if let Some(t) = hwmon_cpu_temp(dev, labels).await {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    read_millideg(fallback).await
+}
+
+#[cfg(test)]
+mod cpu_temp_tests {
+    use super::cpu_temp_millideg;
+    use std::path::{Path, PathBuf};
+
+    /// A throwaway fake sysfs tree with a `hwmon/` dir and a fallback file.
+    struct FakeSysfs(PathBuf);
+
+    impl FakeSysfs {
+        fn new(test: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("ayuz-cputemp-test-{}-{}", std::process::id(), test));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("hwmon")).unwrap();
+            Self(dir)
+        }
+
+        /// Adds `hwmon/<id>` with a driver name and `(index, label, millideg)` sensors.
+        fn hwmon(&self, id: &str, name: &str, sensors: &[(u32, Option<&str>, &str)]) -> &Self {
+            let d = self.0.join("hwmon").join(id);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("name"), format!("{name}\n")).unwrap();
+            for (i, label, value) in sensors {
+                std::fs::write(d.join(format!("temp{i}_input")), format!("{value}\n")).unwrap();
+                if let Some(l) = label {
+                    std::fs::write(d.join(format!("temp{i}_label")), format!("{l}\n")).unwrap();
+                }
+            }
+            self
+        }
+
+        fn thermal_zone0(&self, value: &str) -> &Self {
+            std::fs::write(self.fallback(), format!("{value}\n")).unwrap();
+            self
+        }
+
+        fn hwmon_dir(&self) -> PathBuf {
+            self.0.join("hwmon")
+        }
+
+        fn fallback(&self) -> PathBuf {
+            self.0.join("thermal_zone0_temp")
+        }
+    }
+
+    impl Drop for FakeSysfs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn temp(fs: &FakeSysfs) -> Option<i32> {
+        cpu_temp_millideg(&fs.hwmon_dir(), &fs.fallback()).await
+    }
+
+    #[tokio::test]
+    async fn amd_k10temp_preferred_over_acpi_zone() {
+        // ASUS Zenbook 14 UM3402YA: thermal_zone0 is acpitz and lags behind.
+        let fs = FakeSysfs::new("amd");
+        fs.hwmon("hwmon1", "acpitz", &[(1, None, "43000")])
+            .hwmon("hwmon4", "nvme", &[(1, Some("Composite"), "37850")])
+            .hwmon("hwmon6", "k10temp", &[(1, Some("Tctl"), "47750")])
+            .thermal_zone0("43000");
+        assert_eq!(temp(&fs).await, Some(47750));
+    }
+
+    #[tokio::test]
+    async fn amd_tdie_preferred_over_tctl() {
+        let fs = FakeSysfs::new("tdie");
+        fs.hwmon("hwmon2", "k10temp", &[(1, Some("Tctl"), "70000"), (2, Some("Tdie"), "50000")]);
+        assert_eq!(temp(&fs).await, Some(50000));
+    }
+
+    #[tokio::test]
+    async fn intel_package_temperature_used() {
+        let fs = FakeSysfs::new("intel");
+        fs.hwmon(
+            "hwmon3",
+            "coretemp",
+            &[(2, Some("Core 0"), "51000"), (1, Some("Package id 0"), "55000"), (3, Some("Core 1"), "53000")],
+        )
+        .thermal_zone0("27800");
+        assert_eq!(temp(&fs).await, Some(55000));
+    }
+
+    #[tokio::test]
+    async fn cpu_driver_without_labels_uses_temp1() {
+        let fs = FakeSysfs::new("nolabel");
+        fs.hwmon("hwmon0", "k10temp", &[(1, None, "61000")]);
+        assert_eq!(temp(&fs).await, Some(61000));
+    }
+
+    #[tokio::test]
+    async fn no_cpu_sensor_falls_back_to_thermal_zone0_like_before() {
+        let fs = FakeSysfs::new("fallback");
+        fs.hwmon("hwmon0", "acpitz", &[(1, None, "40000")])
+            .hwmon("hwmon1", "amdgpu", &[(1, Some("edge"), "41000")])
+            .thermal_zone0("40000");
+        assert_eq!(temp(&fs).await, Some(40000));
+    }
+
+    #[tokio::test]
+    async fn unreadable_cpu_sensor_falls_back() {
+        let fs = FakeSysfs::new("garbage");
+        fs.hwmon("hwmon0", "k10temp", &[(1, Some("Tctl"), "garbage")])
+            .thermal_zone0("45000");
+        assert_eq!(temp(&fs).await, Some(45000));
+    }
+
+    #[tokio::test]
+    async fn nothing_available_is_none() {
+        let fs = FakeSysfs::new("none");
+        assert_eq!(temp(&fs).await, None);
+        let missing = Path::new("/nonexistent-ayuz-test");
+        assert_eq!(cpu_temp_millideg(missing, missing).await, None);
     }
 }
 
@@ -994,123 +1112,5 @@ impl HomeModel {
         }
         let add_card = build_add_profile_card(sender);
         self.profiles_flow.append(&add_card);
-    }
-}
-
-#[cfg(test)]
-mod cpu_temp_tests {
-    use super::cpu_temp_millideg;
-    use std::path::{Path, PathBuf};
-
-    /// A throwaway fake sysfs tree with a `hwmon/` dir and a fallback file.
-    struct FakeSysfs(PathBuf);
-
-    impl FakeSysfs {
-        fn new(test: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("ayuz-cputemp-test-{}-{}", std::process::id(), test));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(dir.join("hwmon")).unwrap();
-            Self(dir)
-        }
-
-        /// Adds `hwmon/<id>` with a driver name and `(index, label, millideg)` sensors.
-        fn hwmon(&self, id: &str, name: &str, sensors: &[(u32, Option<&str>, &str)]) -> &Self {
-            let d = self.0.join("hwmon").join(id);
-            std::fs::create_dir_all(&d).unwrap();
-            std::fs::write(d.join("name"), format!("{name}\n")).unwrap();
-            for (i, label, value) in sensors {
-                std::fs::write(d.join(format!("temp{i}_input")), format!("{value}\n")).unwrap();
-                if let Some(l) = label {
-                    std::fs::write(d.join(format!("temp{i}_label")), format!("{l}\n")).unwrap();
-                }
-            }
-            self
-        }
-
-        fn thermal_zone0(&self, value: &str) -> &Self {
-            std::fs::write(self.fallback(), format!("{value}\n")).unwrap();
-            self
-        }
-
-        fn hwmon_dir(&self) -> PathBuf {
-            self.0.join("hwmon")
-        }
-
-        fn fallback(&self) -> PathBuf {
-            self.0.join("thermal_zone0_temp")
-        }
-    }
-
-    impl Drop for FakeSysfs {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    async fn temp(fs: &FakeSysfs) -> Option<i32> {
-        cpu_temp_millideg(&fs.hwmon_dir(), &fs.fallback()).await
-    }
-
-    #[tokio::test]
-    async fn amd_k10temp_preferred_over_acpi_zone() {
-        // ASUS Zenbook 14 UM3402YA: thermal_zone0 is acpitz and lags behind.
-        let fs = FakeSysfs::new("amd");
-        fs.hwmon("hwmon1", "acpitz", &[(1, None, "43000")])
-            .hwmon("hwmon4", "nvme", &[(1, Some("Composite"), "37850")])
-            .hwmon("hwmon6", "k10temp", &[(1, Some("Tctl"), "47750")])
-            .thermal_zone0("43000");
-        assert_eq!(temp(&fs).await, Some(47750));
-    }
-
-    #[tokio::test]
-    async fn amd_tdie_preferred_over_tctl() {
-        let fs = FakeSysfs::new("tdie");
-        fs.hwmon("hwmon2", "k10temp", &[(1, Some("Tctl"), "70000"), (2, Some("Tdie"), "50000")]);
-        assert_eq!(temp(&fs).await, Some(50000));
-    }
-
-    #[tokio::test]
-    async fn intel_package_temperature_used() {
-        let fs = FakeSysfs::new("intel");
-        fs.hwmon(
-            "hwmon3",
-            "coretemp",
-            &[(2, Some("Core 0"), "51000"), (1, Some("Package id 0"), "55000"), (3, Some("Core 1"), "53000")],
-        )
-        .thermal_zone0("27800");
-        assert_eq!(temp(&fs).await, Some(55000));
-    }
-
-    #[tokio::test]
-    async fn cpu_driver_without_labels_uses_temp1() {
-        let fs = FakeSysfs::new("nolabel");
-        fs.hwmon("hwmon0", "k10temp", &[(1, None, "61000")]);
-        assert_eq!(temp(&fs).await, Some(61000));
-    }
-
-    #[tokio::test]
-    async fn no_cpu_sensor_falls_back_to_thermal_zone0_like_before() {
-        let fs = FakeSysfs::new("fallback");
-        fs.hwmon("hwmon0", "acpitz", &[(1, None, "40000")])
-            .hwmon("hwmon1", "amdgpu", &[(1, Some("edge"), "41000")])
-            .thermal_zone0("40000");
-        assert_eq!(temp(&fs).await, Some(40000));
-    }
-
-    #[tokio::test]
-    async fn unreadable_cpu_sensor_falls_back() {
-        let fs = FakeSysfs::new("garbage");
-        fs.hwmon("hwmon0", "k10temp", &[(1, Some("Tctl"), "garbage")])
-            .thermal_zone0("45000");
-        assert_eq!(temp(&fs).await, Some(45000));
-    }
-
-    #[tokio::test]
-    async fn nothing_available_is_none() {
-        let fs = FakeSysfs::new("none");
-        assert_eq!(temp(&fs).await, None);
-        let missing = Path::new("/nonexistent-ayuz-test");
-        assert_eq!(cpu_temp_millideg(missing, missing).await, None);
     }
 }
