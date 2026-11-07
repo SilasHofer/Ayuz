@@ -168,9 +168,9 @@ fn metric_card(icon_name: &str, title: &str) -> (gtk::Box, gtk::Label) {
 /// Capacities (0-100) of all system batteries, whatever the kernel named them
 /// (BAT0, BAT1, BATT, ...). Peripheral batteries such as wireless mice or
 /// headsets report `scope == Device` and are skipped.
-async fn system_battery_capacities() -> Vec<u8> {
+async fn system_battery_capacities(power_supply_dir: &std::path::Path) -> Vec<u8> {
     let mut caps = Vec::new();
-    let Ok(mut entries) = tokio::fs::read_dir(SYS_POWER_SUPPLY_DIR).await else {
+    let Ok(mut entries) = tokio::fs::read_dir(power_supply_dir).await else {
         return caps;
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
@@ -192,16 +192,20 @@ async fn system_battery_capacities() -> Vec<u8> {
     caps
 }
 
+/// Home-screen label for the given battery capacities: their average, or
+/// "N/A" when the machine has no system battery (e.g. a desktop).
+fn battery_label(caps: &[u8]) -> String {
+    if caps.is_empty() {
+        return "N/A".to_string();
+    }
+    let sum: u32 = caps.iter().map(|&c| c as u32).sum();
+    format!("{}%", sum / caps.len() as u32)
+}
+
 async fn fetch_metrics() -> HomeCommandOutput {
-    let battery = {
-        let caps = system_battery_capacities().await;
-        if caps.is_empty() {
-            "N/A".to_string()
-        } else {
-            let sum: u32 = caps.iter().map(|&c| c as u32).sum();
-            format!("{}%", sum / caps.len() as u32)
-        }
-    };
+    let battery = battery_label(
+        &system_battery_capacities(std::path::Path::new(SYS_POWER_SUPPLY_DIR)).await,
+    );
 
     let cpu = {
         let load = tokio::fs::read_to_string(SYS_LOAD_AVG)
@@ -945,5 +949,115 @@ impl HomeModel {
         }
         let add_card = build_add_profile_card(sender);
         self.profiles_flow.append(&add_card);
+    }
+}
+
+#[cfg(test)]
+mod battery_tests {
+    use super::{battery_label, system_battery_capacities};
+    use std::path::{Path, PathBuf};
+
+    /// A throwaway fake `/sys/class/power_supply` directory.
+    struct FakeSysfs(PathBuf);
+
+    impl FakeSysfs {
+        fn new(test: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("ayuz-battery-test-{}-{}", std::process::id(), test));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        /// Adds a supply. `None` leaves the attribute file out.
+        fn supply(&self, name: &str, kind: &str, scope: Option<&str>, capacity: Option<&str>) -> &Self {
+            let d = self.0.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("type"), format!("{kind}\n")).unwrap();
+            if let Some(s) = scope {
+                std::fs::write(d.join("scope"), format!("{s}\n")).unwrap();
+            }
+            if let Some(c) = capacity {
+                std::fs::write(d.join("capacity"), format!("{c}\n")).unwrap();
+            }
+            self
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for FakeSysfs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn label(fs: &FakeSysfs) -> String {
+        battery_label(&system_battery_capacities(fs.path()).await)
+    }
+
+    #[tokio::test]
+    async fn single_bat0_unchanged() {
+        let fs = FakeSysfs::new("bat0");
+        fs.supply("AC", "Mains", None, None)
+            .supply("BAT0", "Battery", Some("System"), Some("57"));
+        assert_eq!(label(&fs).await, "57%");
+    }
+
+    #[tokio::test]
+    async fn bat0_and_bat1_are_averaged_like_before() {
+        let fs = FakeSysfs::new("bat01");
+        fs.supply("BAT0", "Battery", None, Some("80"))
+            .supply("BAT1", "Battery", None, Some("41"));
+        // Previous code: (80 + 41) / 2 = 60 (integer division).
+        assert_eq!(label(&fs).await, "60%");
+    }
+
+    #[tokio::test]
+    async fn non_standard_name_batt_is_found() {
+        // e.g. ASUS Zenbook 14 UM3402YA
+        let fs = FakeSysfs::new("batt");
+        fs.supply("ACAD", "Mains", None, None)
+            .supply("BATT", "Battery", None, Some("41"));
+        assert_eq!(label(&fs).await, "41%");
+    }
+
+    #[tokio::test]
+    async fn desktop_without_battery_is_na() {
+        let fs = FakeSysfs::new("desktop");
+        fs.supply("AC", "Mains", None, None);
+        assert_eq!(label(&fs).await, "N/A");
+    }
+
+    #[tokio::test]
+    async fn missing_directory_is_na() {
+        let missing = std::env::temp_dir().join("ayuz-battery-test-does-not-exist");
+        assert!(system_battery_capacities(&missing).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn peripheral_batteries_are_ignored() {
+        let fs = FakeSysfs::new("peripheral");
+        fs.supply("BAT0", "Battery", Some("System"), Some("90"))
+            .supply("hidpp_battery_0", "Battery", Some("Device"), Some("5"));
+        assert_eq!(label(&fs).await, "90%");
+    }
+
+    #[tokio::test]
+    async fn ups_and_unreadable_capacity_are_ignored() {
+        let fs = FakeSysfs::new("ups");
+        fs.supply("ups0", "UPS", None, Some("100"))
+            .supply("BAT0", "Battery", None, Some("garbage"))
+            .supply("BAT1", "Battery", None, Some("33"));
+        assert_eq!(label(&fs).await, "33%");
+    }
+
+    #[tokio::test]
+    async fn capacity_above_100_is_clamped() {
+        let fs = FakeSysfs::new("clamp");
+        fs.supply("BAT0", "Battery", None, Some("101"));
+        assert_eq!(label(&fs).await, "100%");
     }
 }
